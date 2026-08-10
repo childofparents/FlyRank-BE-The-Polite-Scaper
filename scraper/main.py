@@ -18,6 +18,15 @@ TIMEOUT_SECONDS = 5
 DELAY_SECONDS = 0.5
 MAX_PAGES = 3
 
+# Global Stats Tracker
+run_stats = {
+    "pages_fetched": 0,
+    "cache_hits": 0,
+    "failed_pages": 0,
+    "valid_records": 0,
+    "invalid_records": 0
+}
+
 
 # --- Pydantic Schema ---
 class BookRecord(BaseModel):
@@ -33,7 +42,7 @@ class BookRecord(BaseModel):
 
 
 def get_html(url, filename):
-    """Fetches HTML from cache or network with politeness."""
+    """Fetches HTML with cache checking, politeness, and retry logic."""
     if not os.path.exists(CACHE_DIR):
         os.makedirs(CACHE_DIR)
 
@@ -41,28 +50,51 @@ def get_html(url, filename):
 
     if os.path.exists(cache_file):
         with open(cache_file, "r", encoding="utf-8") as f:
+            run_stats["cache_hits"] += 1
             return f.read()
 
-    time.sleep(DELAY_SECONDS)
-
     headers = {"User-Agent": USER_AGENT}
-    try:
-        response = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
-        if response.status_code == 200:
-            html = response.text
-            with open(cache_file, "w", encoding="utf-8") as f:
-                f.write(html)
-            return html
-        else:
-            print(f"Failed to fetch {url}. Status: {response.status_code}")
-            return None
-    except requests.exceptions.RequestException as e:
-        print(f"Request failed for {url}: {e}")
-        return None
+
+    # Retry loop: max 2 attempts (1 initial + 1 retry)
+    for attempt in range(2):
+        time.sleep(DELAY_SECONDS)
+        try:
+            response = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
+            run_stats["pages_fetched"] += 1
+
+            if response.status_code == 200:
+                html = response.text
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    f.write(html)
+                return html
+            elif response.status_code in [403, 404]:
+                print(f"Skipping {url}. Status: {response.status_code} (No retry)")
+                run_stats["failed_pages"] += 1
+                return None
+            elif response.status_code >= 500:
+                print(f"Server error {response.status_code} for {url}.")
+                if attempt == 0:
+                    print("Retrying...")
+                    continue
+                else:
+                    run_stats["failed_pages"] += 1
+                    return None
+            else:
+                run_stats["failed_pages"] += 1
+                return None
+
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed for {url}: {e}")
+            if attempt == 0:
+                print("Retrying...")
+                continue
+            else:
+                run_stats["failed_pages"] += 1
+                return None
 
 
 def discover_book_urls():
-    """Crawls up to MAX_PAGES catalogue pages and extracts book URLs and their sources."""
+    """Crawls up to MAX_PAGES catalogue pages and extracts book URLs."""
     current_url = START_URL
     pages_crawled = 0
     all_discovered_urls = []
@@ -100,10 +132,6 @@ def discover_book_urls():
         if item["url"] not in unique_urls:
             unique_urls[item["url"]] = item["source"]
 
-    print(f"catalogue_pages = {pages_crawled}")
-    print(f"discovered = {len(all_discovered_urls)}")
-    print(f"unique_urls = {len(unique_urls)}")
-
     return unique_urls
 
 
@@ -112,7 +140,8 @@ def extract_book_details(book_links):
     raw_records = []
 
     for product_url, source_page in book_links.items():
-        folder_slug = product_url.strip("/").split("/")[-2]
+        folder_slug = product_url.strip("/").split("/")[-2] if len(
+            product_url.strip("/").split("/")) > 1 else "fake-url"
         filename = f"book-{folder_slug}.html"
 
         html = get_html(product_url, filename)
@@ -121,6 +150,10 @@ def extract_book_details(book_links):
 
         soup = BeautifulSoup(html, "html.parser")
         product_main = soup.find("div", class_="col-sm-6 product_main")
+
+        if not product_main:
+            print(f"Warning: Missing product main div on {product_url}")
+            continue
 
         title = product_main.find("h1").text if product_main and product_main.find("h1") else None
 
@@ -155,7 +188,6 @@ def extract_book_details(book_links):
 
         raw_records.append(record)
 
-    print(f"detail_pages = {len(raw_records)}")
     return raw_records
 
 
@@ -163,7 +195,6 @@ def clean_price(price_text):
     """Extracts numeric value from price text."""
     if not price_text:
         return 0.0
-    # Strip everything except digits and the decimal point
     clean_str = re.sub(r'[^\d.]', '', price_text)
     return float(clean_str) if clean_str else 0.0
 
@@ -177,54 +208,77 @@ def validate_and_store(raw_records):
     errors = []
 
     for raw in raw_records:
-        # Add the numeric price_gbp to the raw record before validation
         raw["price_gbp"] = clean_price(raw.get("price_text"))
 
         try:
-            # Validate against schema
             valid_record = BookRecord(**raw)
-            # Use the product URL as the canonical key for idempotency
             url_key = str(valid_record.product_url)
 
-            # Serialize HttpUrls to strings using model_dump(mode='json') for Pydantic v2
-            # Or use json() fallback for broader compatibility
             if hasattr(valid_record, 'model_dump'):
                 valid_books_dict[url_key] = valid_record.model_dump(mode='json')
             else:
                 valid_books_dict[url_key] = json.loads(valid_record.json())
+
+            run_stats["valid_records"] += 1
 
         except ValidationError as e:
             errors.append({
                 "record": raw,
                 "error": e.errors()
             })
+            run_stats["invalid_records"] += 1
 
-    # Convert the dictionary back to a list for saving
     final_valid_records = list(valid_books_dict.values())
 
-    # Save valid records
     with open(os.path.join(OUTPUT_DIR, "books.json"), "w", encoding="utf-8") as f:
         json.dump(final_valid_records, f, indent=2)
 
-    # Save errors if any exist
     if errors:
         with open(os.path.join(OUTPUT_DIR, "errors.json"), "w", encoding="utf-8") as f:
             json.dump(errors, f, indent=2)
 
-    print(f"Validation complete: {len(final_valid_records)} valid records saved to output/books.json.")
-    if errors:
-        print(f"WARNING: {len(errors)} records failed validation. See output/errors.json.")
+
+def generate_report(start_time):
+    """Generates the final run report."""
+    end_time = time.time()
+    duration_seconds = round(end_time - start_time, 2)
+
+    report = {
+        "start_time": datetime.fromtimestamp(start_time, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "duration_seconds": duration_seconds,
+        "pages_fetched": run_stats["pages_fetched"],
+        "cache_hits": run_stats["cache_hits"],
+        "valid_records": run_stats["valid_records"],
+        "invalid_records": run_stats["invalid_records"],
+        "failed_pages": run_stats["failed_pages"]
+    }
+
+    with open(os.path.join(OUTPUT_DIR, "run-report.json"), "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+
+    print("\n--- Run Report ---")
+    print(json.dumps(report, indent=2))
 
 
 def main():
+    start_time = time.time()
+
     print("Starting Stage 2 discovery...")
     book_links = discover_book_urls()
+
+    # STAGE 5 PROOF: Injecting a fake URL that will 404
+    fake_url = "https://books.toscrape.com/catalogue/this-book-does-not-exist/index.html"
+    print(f"\nInjecting fake URL to test failure handling: {fake_url}")
+    book_links[fake_url] = START_URL
 
     print("\nStarting Stage 3 extraction...")
     raw_records = extract_book_details(book_links)
 
     print("\nStarting Stage 4 validation and storage...")
     validate_and_store(raw_records)
+
+    print("\nGenerating Stage 5 run report...")
+    generate_report(start_time)
 
 
 if __name__ == "__main__":
