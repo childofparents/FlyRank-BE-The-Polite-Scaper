@@ -2,17 +2,34 @@ import os
 import time
 import requests
 import json
+import re
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from datetime import datetime, timezone
+from pydantic import BaseModel, HttpUrl, ValidationError
+from typing import Optional
 
 # Constants
 CACHE_DIR = "cache"
+OUTPUT_DIR = "output"
 START_URL = "https://books.toscrape.com/catalogue/page-1.html"
 USER_AGENT = "FlyRankInternship-A9/1.0 (+https://github.com/childofparents/FlyRank-BE-The-Polite-Scaper)"
 TIMEOUT_SECONDS = 5
 DELAY_SECONDS = 0.5
 MAX_PAGES = 3
+
+
+# --- Pydantic Schema ---
+class BookRecord(BaseModel):
+    title: str
+    product_url: HttpUrl
+    price_text: str
+    price_gbp: float
+    availability_text: str
+    rating_text: Optional[str] = None
+    description: Optional[str] = None
+    source_page: HttpUrl
+    fetched_at: str
 
 
 def get_html(url, filename):
@@ -95,7 +112,6 @@ def extract_book_details(book_links):
     raw_records = []
 
     for product_url, source_page in book_links.items():
-        # Create a safe, unique filename based on the book's URL slug
         folder_slug = product_url.strip("/").split("/")[-2]
         filename = f"book-{folder_slug}.html"
 
@@ -106,7 +122,6 @@ def extract_book_details(book_links):
         soup = BeautifulSoup(html, "html.parser")
         product_main = soup.find("div", class_="col-sm-6 product_main")
 
-        # Extract fields
         title = product_main.find("h1").text if product_main and product_main.find("h1") else None
 
         price_tag = product_main.find("p", class_="price_color")
@@ -118,7 +133,6 @@ def extract_book_details(book_links):
         rating_tag = product_main.find("p", class_="star-rating")
         rating = rating_tag["class"][1] if rating_tag and len(rating_tag["class"]) > 1 else None
 
-        # Description is outside the product_main div
         description = None
         desc_heading = soup.find("div", id="product_description")
         if desc_heading:
@@ -142,12 +156,64 @@ def extract_book_details(book_links):
         raw_records.append(record)
 
     print(f"detail_pages = {len(raw_records)}")
-
-    # Print the first complete record as proof
-    if raw_records:
-        print(json.dumps(raw_records[0], indent=2))
-
     return raw_records
+
+
+def clean_price(price_text):
+    """Extracts numeric value from price text."""
+    if not price_text:
+        return 0.0
+    # Strip everything except digits and the decimal point
+    clean_str = re.sub(r'[^\d.]', '', price_text)
+    return float(clean_str) if clean_str else 0.0
+
+
+def validate_and_store(raw_records):
+    """Validates records with Pydantic and saves to JSON files."""
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+
+    valid_books_dict = {}
+    errors = []
+
+    for raw in raw_records:
+        # Add the numeric price_gbp to the raw record before validation
+        raw["price_gbp"] = clean_price(raw.get("price_text"))
+
+        try:
+            # Validate against schema
+            valid_record = BookRecord(**raw)
+            # Use the product URL as the canonical key for idempotency
+            url_key = str(valid_record.product_url)
+
+            # Serialize HttpUrls to strings using model_dump(mode='json') for Pydantic v2
+            # Or use json() fallback for broader compatibility
+            if hasattr(valid_record, 'model_dump'):
+                valid_books_dict[url_key] = valid_record.model_dump(mode='json')
+            else:
+                valid_books_dict[url_key] = json.loads(valid_record.json())
+
+        except ValidationError as e:
+            errors.append({
+                "record": raw,
+                "error": e.errors()
+            })
+
+    # Convert the dictionary back to a list for saving
+    final_valid_records = list(valid_books_dict.values())
+
+    # Save valid records
+    with open(os.path.join(OUTPUT_DIR, "books.json"), "w", encoding="utf-8") as f:
+        json.dump(final_valid_records, f, indent=2)
+
+    # Save errors if any exist
+    if errors:
+        with open(os.path.join(OUTPUT_DIR, "errors.json"), "w", encoding="utf-8") as f:
+            json.dump(errors, f, indent=2)
+
+    print(f"Validation complete: {len(final_valid_records)} valid records saved to output/books.json.")
+    if errors:
+        print(f"WARNING: {len(errors)} records failed validation. See output/errors.json.")
 
 
 def main():
@@ -155,7 +221,10 @@ def main():
     book_links = discover_book_urls()
 
     print("\nStarting Stage 3 extraction...")
-    extract_book_details(book_links)
+    raw_records = extract_book_details(book_links)
+
+    print("\nStarting Stage 4 validation and storage...")
+    validate_and_store(raw_records)
 
 
 if __name__ == "__main__":
