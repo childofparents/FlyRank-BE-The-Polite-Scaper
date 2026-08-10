@@ -1,0 +1,11 @@
+# Python environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.idea
+
+# Assignment specific directories
+cache/
+output/
